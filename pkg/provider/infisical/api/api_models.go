@@ -39,10 +39,11 @@ type RevokeMachineIdentityAccessTokenResponse struct {
 }
 
 type GetSecretByKeyV3Request struct {
-	EnvironmentSlug string `json:"environment"`
-	ProjectSlug     string `json:"workspaceId"`
-	SecretPath      string `json:"secretPath,omitempty"`
-	SecretKey       string `json:"secretKey"`
+	EnvironmentSlug        string `json:"environment"`
+	ProjectSlug            string `json:"workspaceSlug"`
+	SecretPath             string `json:"secretPath"`
+	SecretKey              string `json:"secretKey"`
+	ExpandSecretReferences bool   `json:"expandSecretReferences"`
 }
 
 type GetSecretByKeyV3Response struct {
@@ -50,9 +51,11 @@ type GetSecretByKeyV3Response struct {
 }
 
 type GetSecretsV3Request struct {
-	EnvironmentSlug string `json:"environment"`
-	ProjectSlug     string `json:"workspaceId"`
-	SecretPath      string `json:"secretPath,omitempty"`
+	EnvironmentSlug        string `json:"environment"`
+	ProjectSlug            string `json:"workspaceSlug"`
+	Recursive              bool   `json:"recursive"`
+	SecretPath             string `json:"secretPath"`
+	ExpandSecretReferences bool   `json:"expandSecretReferences"`
 }
 
 type GetSecretsV3Response struct {
@@ -91,5 +94,7 @@ type ImportedSecretV3 struct {
 type InfisicalAPIErrorResponse struct {
 	StatusCode int    `json:"statusCode"`
 	Message    string `json:"message"`
-	Error      any    `json:"error"`
+	Error      string `json:"error"`
+	// According to Infisical's API docs, `details` are only returned for 403 errors.
+	Details any `json:"details,omitempty"`
 }

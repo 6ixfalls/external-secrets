@@ -155,7 +155,7 @@ func New(ctx context.Context, store esv1beta1.GenericStore, kube client.Client, 
 	return sess, nil
 }
 
-// NewSession creates a new aws session based on the provided store
+// NewGeneratorSession creates a new aws session based on the provided store
 // it uses the following authentication mechanisms in order:
 // * service-account token authentication via AssumeRoleWithWebIdentity
 // * static credentials from a Kind=Secret, optionally with doing a AssumeRole.
@@ -330,7 +330,7 @@ func getAWSSession(config *aws.Config, enableCache bool, name, kind, namespace, 
 		sess, ok := sessionCache.Get(resourceVersion, key)
 		if ok {
 			log.Info("reusing aws session", "SecretStore", key.Name, "namespace", key.Namespace, "kind", key.Kind, "resourceversion", resourceVersion)
-			return sess, nil
+			return sess.Copy(), nil
 		}
 	}
 

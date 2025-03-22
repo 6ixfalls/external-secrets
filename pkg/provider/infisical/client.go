@@ -38,10 +38,11 @@ var (
 // then the secret entry will be deleted depending on the deletionPolicy.
 func (p *Provider) GetSecret(ctx context.Context, ref esv1beta1.ExternalSecretDataRemoteRef) ([]byte, error) {
 	secret, err := p.apiClient.GetSecretByKeyV3(api.GetSecretByKeyV3Request{
-		EnvironmentSlug: p.apiScope.EnvironmentSlug,
-		ProjectSlug:     p.apiScope.ProjectSlug,
-		SecretPath:      "/" + ref.Key,
-		SecretKey:       ref.Property,
+		EnvironmentSlug:        p.apiScope.EnvironmentSlug,
+		ProjectSlug:            p.apiScope.ProjectSlug,
+		SecretPath:             "/" + ref.Key,
+		SecretKey:              ref.Property,
+		ExpandSecretReferences: p.apiScope.ExpandSecretReferences,
 	})
 
 	if err != nil {
@@ -83,9 +84,11 @@ func (p *Provider) GetAllSecrets(ctx context.Context, ref esv1beta1.ExternalSecr
 	}
 
 	secrets, err := p.apiClient.GetSecretsV3(api.GetSecretsV3Request{
-		EnvironmentSlug: p.apiScope.EnvironmentSlug,
-		ProjectSlug:     p.apiScope.ProjectSlug,
-		SecretPath:      "/" + *ref.Path,
+		EnvironmentSlug:        p.apiScope.EnvironmentSlug,
+		ProjectSlug:            p.apiScope.ProjectSlug,
+		SecretPath:             "/" + *ref.Path,
+		Recursive:              p.apiScope.Recursive,
+		ExpandSecretReferences: p.apiScope.ExpandSecretReferences,
 	})
 	if err != nil {
 		return nil, err
@@ -124,12 +127,14 @@ func (p *Provider) GetAllSecrets(ctx context.Context, ref esv1beta1.ExternalSecr
 func (p *Provider) Validate() (esv1beta1.ValidationResult, error) {
 	// try to fetch the secrets to ensure provided credentials has access to read secrets
 	_, err := p.apiClient.GetSecretsV3(api.GetSecretsV3Request{
-		EnvironmentSlug: p.apiScope.EnvironmentSlug,
-		ProjectSlug:     p.apiScope.ProjectSlug,
+		EnvironmentSlug:        p.apiScope.EnvironmentSlug,
+		ProjectSlug:            p.apiScope.ProjectSlug,
+		Recursive:              p.apiScope.Recursive,
+		ExpandSecretReferences: p.apiScope.ExpandSecretReferences,
 	})
 
 	if err != nil {
-		return esv1beta1.ValidationResultError, fmt.Errorf("cannot read secrets with provided project scope project:%s environment:%s, %w", p.apiScope.ProjectSlug, p.apiScope.EnvironmentSlug, err)
+		return esv1beta1.ValidationResultError, fmt.Errorf("cannot read secrets with provided project scope project:%s environment:%s recursive:%t, %w", p.apiScope.ProjectSlug, p.apiScope.EnvironmentSlug, p.apiScope.Recursive, err)
 	}
 
 	return esv1beta1.ValidationResultReady, nil

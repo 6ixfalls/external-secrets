@@ -96,8 +96,8 @@ func (p *Provider) NewClient(ctx context.Context, store esv1beta1.GenericStore, 
 	return p.newClient(ctx, store, kube, clientset.CoreV1(), namespace)
 }
 
-func (p *Provider) NewGeneratorClient(ctx context.Context, kube kclient.Client, corev1 typedcorev1.CoreV1Interface, vaultSpec *esv1beta1.VaultProvider, namespace string) (util.Client, error) {
-	vStore, cfg, err := p.prepareConfig(ctx, kube, corev1, vaultSpec, nil, namespace, resolvers.EmptyStoreKind)
+func (p *Provider) NewGeneratorClient(ctx context.Context, kube kclient.Client, corev1 typedcorev1.CoreV1Interface, vaultSpec *esv1beta1.VaultProvider, namespace string, retrySettings *esv1beta1.SecretStoreRetrySettings) (util.Client, error) {
+	vStore, cfg, err := p.prepareConfig(ctx, kube, corev1, vaultSpec, retrySettings, namespace, resolvers.EmptyStoreKind)
 	if err != nil {
 		return nil, err
 	}
@@ -212,7 +212,8 @@ func (p *Provider) prepareConfig(ctx context.Context, kube kclient.Client, corev
 }
 
 func getVaultClient(p *Provider, store esv1beta1.GenericStore, cfg *vault.Config) (util.Client, error) {
-	isStaticToken := store.GetSpec().Provider.Vault.Auth.TokenSecretRef != nil
+	auth := store.GetSpec().Provider.Vault.Auth
+	isStaticToken := auth != nil && auth.TokenSecretRef != nil
 	useCache := enableCache && !isStaticToken
 
 	key := cache.Key{
@@ -239,6 +240,10 @@ func getVaultClient(p *Provider, store esv1beta1.GenericStore, cfg *vault.Config
 }
 
 func isReferentSpec(prov *esv1beta1.VaultProvider) bool {
+	if prov.Auth == nil {
+		return false
+	}
+
 	if prov.Auth.TokenSecretRef != nil && prov.Auth.TokenSecretRef.Namespace == nil {
 		return true
 	}

@@ -32,6 +32,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	esapi "github.com/external-secrets/external-secrets/apis/externalsecrets/v1alpha1"
@@ -39,24 +40,25 @@ import (
 	ctrlmetrics "github.com/external-secrets/external-secrets/pkg/controllers/metrics"
 	"github.com/external-secrets/external-secrets/pkg/controllers/pushsecret/psmetrics"
 	"github.com/external-secrets/external-secrets/pkg/controllers/secretstore"
+	"github.com/external-secrets/external-secrets/pkg/controllers/util"
+	"github.com/external-secrets/external-secrets/pkg/generator/statemanager"
 	"github.com/external-secrets/external-secrets/pkg/provider/util/locks"
 	"github.com/external-secrets/external-secrets/pkg/utils"
 	"github.com/external-secrets/external-secrets/pkg/utils/resolvers"
 
-	// load generators.
 	_ "github.com/external-secrets/external-secrets/pkg/generator/register"
 )
 
 const (
-	errFailedGetSecret       = "could not get source secret"
-	errPatchStatus           = "error merging"
-	errGetSecretStore        = "could not get SecretStore %q, %w"
-	errGetClusterSecretStore = "could not get ClusterSecretStore %q, %w"
-	errSetSecretFailed       = "could not write remote ref %v to target secretstore %v: %v"
-	errFailedSetSecret       = "set secret failed: %v"
-	errConvert               = "could not apply conversion strategy to keys: %v"
-	errUnmanagedStores       = "PushSecret %q has no managed stores to push to"
-	pushSecretFinalizer      = "pushsecret.externalsecrets.io/finalizer"
+	errFailedGetSecret         = "could not get source secret"
+	errPatchStatus             = "error merging"
+	errGetSecretStore          = "could not get SecretStore %q, %w"
+	errGetClusterSecretStore   = "could not get ClusterSecretStore %q, %w"
+	errSetSecretFailed         = "could not write remote ref %v to target secretstore %v: %v"
+	errFailedSetSecret         = "set secret failed: %v"
+	errConvert                 = "could not apply conversion strategy to keys: %v"
+	pushSecretFinalizer        = "pushsecret.externalsecrets.io/finalizer"
+	errCloudNotUpdateFinalizer = "could not update finalizers: %w"
 )
 
 type Reconciler struct {
@@ -69,10 +71,11 @@ type Reconciler struct {
 	ControllerClass string
 }
 
-func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
+func (r *Reconciler) SetupWithManager(mgr ctrl.Manager, opts controller.Options) error {
 	r.recorder = mgr.GetEventRecorderFor("pushsecret")
 
 	return ctrl.NewControllerManagedBy(mgr).
+		WithOptions(opts).
 		For(&esapi.PushSecret{}).
 		Complete(r)
 }
@@ -117,44 +120,48 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	case esapi.PushSecretDeletionPolicyDelete:
 		// finalizer logic. Only added if we should delete the secrets
 		if ps.ObjectMeta.DeletionTimestamp.IsZero() {
-			if !controllerutil.ContainsFinalizer(&ps, pushSecretFinalizer) {
-				controllerutil.AddFinalizer(&ps, pushSecretFinalizer)
+			if added := controllerutil.AddFinalizer(&ps, pushSecretFinalizer); added {
 				if err := r.Client.Update(ctx, &ps, &client.UpdateOptions{}); err != nil {
-					return ctrl.Result{}, fmt.Errorf("could not update finalizers: %w", err)
+					return ctrl.Result{}, fmt.Errorf(errCloudNotUpdateFinalizer, err)
 				}
-
-				return ctrl.Result{}, nil
+				return ctrl.Result{Requeue: true}, nil
 			}
-		} else {
-			if controllerutil.ContainsFinalizer(&ps, pushSecretFinalizer) {
-				// trigger a cleanup with no Synced Map
-				badState, err := r.DeleteSecretFromProviders(ctx, &ps, esapi.SyncedPushSecretsMap{}, mgr)
-				if err != nil {
-					msg := fmt.Sprintf("Failed to Delete Secrets from Provider: %v", err)
-					r.markAsFailed(msg, &ps, badState)
-
-					return ctrl.Result{}, err
-				}
-
-				controllerutil.RemoveFinalizer(&ps, pushSecretFinalizer)
-				if err := r.Client.Update(ctx, &ps, &client.UpdateOptions{}); err != nil {
-					return ctrl.Result{}, fmt.Errorf("could not update finalizers: %w", err)
-				}
-
-				return ctrl.Result{}, nil
+		} else if controllerutil.ContainsFinalizer(&ps, pushSecretFinalizer) {
+			// trigger a cleanup with no Synced Map
+			badState, err := r.DeleteSecretFromProviders(ctx, &ps, esapi.SyncedPushSecretsMap{}, mgr)
+			if err != nil {
+				msg := fmt.Sprintf("Failed to Delete Secrets from Provider: %v", err)
+				r.markAsFailed(msg, &ps, badState)
+				return ctrl.Result{}, err
 			}
+			controllerutil.RemoveFinalizer(&ps, pushSecretFinalizer)
+			if err := r.Client.Update(ctx, &ps, &client.UpdateOptions{}); err != nil {
+				return ctrl.Result{}, fmt.Errorf("could not update finalizers: %w", err)
+			}
+
+			return ctrl.Result{}, nil
 		}
 	case esapi.PushSecretDeletionPolicyNone:
 		if controllerutil.ContainsFinalizer(&ps, pushSecretFinalizer) {
 			controllerutil.RemoveFinalizer(&ps, pushSecretFinalizer)
 			if err := r.Client.Update(ctx, &ps, &client.UpdateOptions{}); err != nil {
-				return ctrl.Result{}, fmt.Errorf("could not update finalizers: %w", err)
+				return ctrl.Result{}, fmt.Errorf(errCloudNotUpdateFinalizer, err)
 			}
 		}
 	default:
 	}
 
-	secret, err := r.resolveSecret(ctx, ps)
+	timeSinceLastRefresh := 0 * time.Second
+	if !ps.Status.RefreshTime.IsZero() {
+		timeSinceLastRefresh = time.Since(ps.Status.RefreshTime.Time)
+	}
+	if !shouldRefresh(ps) {
+		refreshInt = (ps.Spec.RefreshInterval.Duration - timeSinceLastRefresh) + 5*time.Second
+		log.V(1).Info("skipping refresh", "rv", util.GetResourceVersion(ps.ObjectMeta), "nr", refreshInt.Seconds())
+		return ctrl.Result{RequeueAfter: refreshInt}, nil
+	}
+
+	secrets, err := r.resolveSecrets(ctx, &ps)
 	if err != nil {
 		r.markAsFailed(errFailedGetSecret, &ps, nil)
 
@@ -164,10 +171,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	if err != nil {
 		r.markAsFailed(err.Error(), &ps, nil)
 
-		return ctrl.Result{}, err
-	}
-
-	if err := r.applyTemplate(ctx, &ps, secret); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -181,53 +184,77 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, nil
 	}
 
-	syncedSecrets, err := r.PushSecretToProviders(ctx, secretStores, ps, secret, mgr)
-	if err != nil {
-		if errors.Is(err, locks.ErrConflict) {
-			log.Info("retry to acquire lock to update the secret later", "error", err)
-			return ctrl.Result{Requeue: true}, nil
-		}
-
-		totalSecrets := mergeSecretState(syncedSecrets, ps.Status.SyncedPushSecrets)
-		msg := fmt.Sprintf(errFailedSetSecret, err)
-		r.markAsFailed(msg, &ps, totalSecrets)
-
-		return ctrl.Result{}, err
-	}
-	switch ps.Spec.DeletionPolicy {
-	case esapi.PushSecretDeletionPolicyDelete:
-		badSyncState, err := r.DeleteSecretFromProviders(ctx, &ps, syncedSecrets, mgr)
-		if err != nil {
-			msg := fmt.Sprintf("Failed to Delete Secrets from Provider: %v", err)
-			r.markAsFailed(msg, &ps, badSyncState)
+	allSyncedSecrets := make(esapi.SyncedPushSecretsMap)
+	for _, secret := range secrets {
+		if err := r.applyTemplate(ctx, &ps, &secret); err != nil {
 			return ctrl.Result{}, err
 		}
-	case esapi.PushSecretDeletionPolicyNone:
-	default:
+
+		syncedSecrets, err := r.PushSecretToProviders(ctx, secretStores, ps, &secret, mgr)
+		if err != nil {
+			if errors.Is(err, locks.ErrConflict) {
+				log.Info("retry to acquire lock to update the secret later", "error", err)
+				return ctrl.Result{Requeue: true}, nil
+			}
+
+			totalSecrets := mergeSecretState(syncedSecrets, ps.Status.SyncedPushSecrets)
+			msg := fmt.Sprintf(errFailedSetSecret, err)
+			r.markAsFailed(msg, &ps, totalSecrets)
+
+			return ctrl.Result{}, err
+		}
+		switch ps.Spec.DeletionPolicy {
+		case esapi.PushSecretDeletionPolicyDelete:
+			badSyncState, err := r.DeleteSecretFromProviders(ctx, &ps, syncedSecrets, mgr)
+			if err != nil {
+				msg := fmt.Sprintf("Failed to Delete Secrets from Provider: %v", err)
+				r.markAsFailed(msg, &ps, badSyncState)
+				return ctrl.Result{}, err
+			}
+		case esapi.PushSecretDeletionPolicyNone:
+		default:
+		}
+
+		allSyncedSecrets = mergeSecretState(allSyncedSecrets, syncedSecrets)
 	}
 
-	r.markAsDone(&ps, syncedSecrets)
+	r.markAsDone(&ps, allSyncedSecrets, start)
 
 	return ctrl.Result{RequeueAfter: refreshInt}, nil
 }
 
+func shouldRefresh(ps esapi.PushSecret) bool {
+	if ps.Status.SyncedResourceVersion != util.GetResourceVersion(ps.ObjectMeta) {
+		return true
+	}
+	if ps.Spec.RefreshInterval.Duration == 0 && ps.Status.SyncedResourceVersion != "" {
+		return false
+	}
+	if ps.Status.RefreshTime.IsZero() {
+		return true
+	}
+	return ps.Status.RefreshTime.Add(ps.Spec.RefreshInterval.Duration).Before(time.Now())
+}
+
 func (r *Reconciler) markAsFailed(msg string, ps *esapi.PushSecret, syncState esapi.SyncedPushSecretsMap) {
-	cond := newPushSecretCondition(esapi.PushSecretReady, v1.ConditionFalse, esapi.ReasonErrored, msg)
-	setPushSecretCondition(ps, *cond)
+	cond := NewPushSecretCondition(esapi.PushSecretReady, v1.ConditionFalse, esapi.ReasonErrored, msg)
+	SetPushSecretCondition(ps, *cond)
 	if syncState != nil {
 		r.setSecrets(ps, syncState)
 	}
 	r.recorder.Event(ps, v1.EventTypeWarning, esapi.ReasonErrored, msg)
 }
 
-func (r *Reconciler) markAsDone(ps *esapi.PushSecret, secrets esapi.SyncedPushSecretsMap) {
+func (r *Reconciler) markAsDone(ps *esapi.PushSecret, secrets esapi.SyncedPushSecretsMap, start time.Time) {
 	msg := "PushSecret synced successfully"
 	if ps.Spec.UpdatePolicy == esapi.PushSecretUpdatePolicyIfNotExists {
 		msg += ". Existing secrets in providers unchanged."
 	}
-	cond := newPushSecretCondition(esapi.PushSecretReady, v1.ConditionTrue, esapi.ReasonSynced, msg)
-	setPushSecretCondition(ps, *cond)
+	cond := NewPushSecretCondition(esapi.PushSecretReady, v1.ConditionTrue, esapi.ReasonSynced, msg)
+	SetPushSecretCondition(ps, *cond)
 	r.setSecrets(ps, secrets)
+	ps.Status.RefreshTime = metav1.NewTime(start)
+	ps.Status.SyncedResourceVersion = util.GetResourceVersion(ps.ObjectMeta)
 	r.recorder.Event(ps, v1.EventTypeNormal, esapi.ReasonSynced, msg)
 }
 
@@ -236,6 +263,10 @@ func (r *Reconciler) setSecrets(ps *esapi.PushSecret, status esapi.SyncedPushSec
 }
 
 func mergeSecretState(newMap, old esapi.SyncedPushSecretsMap) esapi.SyncedPushSecretsMap {
+	if newMap == nil {
+		return old
+	}
+
 	out := newMap.DeepCopy()
 	for k, v := range old {
 		_, ok := out[k]
@@ -353,30 +384,74 @@ func secretKeyExists(key string, secret *v1.Secret) bool {
 	return key == "" || ok
 }
 
-func (r *Reconciler) resolveSecret(ctx context.Context, ps esapi.PushSecret) (*v1.Secret, error) {
-	if ps.Spec.Selector.Secret != nil {
+const defaultGeneratorStateKey = "__pushsecret"
+
+func (r *Reconciler) resolveSecrets(ctx context.Context, ps *esapi.PushSecret) ([]v1.Secret, error) {
+	var err error
+	generatorState := statemanager.New(ctx, r.Client, r.Scheme, ps.Namespace, ps)
+	defer func() {
+		if err != nil {
+			if err := generatorState.Rollback(); err != nil {
+				r.Log.Error(err, "error rolling back generator state")
+			}
+
+			return
+		}
+		if err := generatorState.Commit(); err != nil {
+			r.Log.Error(err, "error committing generator state")
+		}
+	}()
+
+	switch {
+	case ps.Spec.Selector.Secret != nil && ps.Spec.Selector.Secret.Name != "":
 		secretName := types.NamespacedName{Name: ps.Spec.Selector.Secret.Name, Namespace: ps.Namespace}
 		secret := &v1.Secret{}
-		err := r.Client.Get(ctx, secretName, secret)
+		if err := r.Client.Get(ctx, secretName, secret); err != nil {
+			return nil, err
+		}
+		generatorState.EnqueueFlagLatestStateForGC(defaultGeneratorStateKey)
+
+		return []v1.Secret{*secret}, nil
+	case ps.Spec.Selector.GeneratorRef != nil:
+		secret, err := r.resolveSecretFromGenerator(ctx, ps.Namespace, ps.Spec.Selector.GeneratorRef, generatorState)
+		if err != nil {
+			return nil, fmt.Errorf("could not resolve secret from generator ref %v: %w", ps.Spec.Selector.GeneratorRef, err)
+		}
+
+		return []v1.Secret{*secret}, nil
+	case ps.Spec.Selector.Secret != nil && ps.Spec.Selector.Secret.Selector != nil:
+		labelSelector, err := metav1.LabelSelectorAsSelector(ps.Spec.Selector.Secret.Selector)
 		if err != nil {
 			return nil, err
 		}
-		return secret, nil
+
+		var secretList v1.SecretList
+		err = r.List(ctx, &secretList, &client.ListOptions{LabelSelector: labelSelector})
+		if err != nil {
+			return nil, err
+		}
+
+		return secretList.Items, err
 	}
-	if ps.Spec.Selector.GeneratorRef != nil {
-		return r.resolveSecretFromGenerator(ctx, ps.Namespace, ps.Spec.Selector.GeneratorRef)
-	}
+
 	return nil, errors.New("no secret selector provided")
 }
 
-func (r *Reconciler) resolveSecretFromGenerator(ctx context.Context, namespace string, generatorRef *v1beta1.GeneratorRef) (*v1.Secret, error) {
-	gen, obj, err := resolvers.GeneratorRef(ctx, r.RestConfig, namespace, generatorRef)
+func (r *Reconciler) resolveSecretFromGenerator(ctx context.Context, namespace string, generatorRef *v1beta1.GeneratorRef, generatorState *statemanager.Manager) (*v1.Secret, error) {
+	gen, genResource, err := resolvers.GeneratorRef(ctx, r.Client, r.Scheme, namespace, generatorRef)
 	if err != nil {
 		return nil, fmt.Errorf("unable to resolve generator: %w", err)
 	}
-	secretMap, err := gen.Generate(ctx, obj, r.Client, namespace)
+	prevState, err := generatorState.GetLatestState(defaultGeneratorStateKey)
+	if err != nil {
+		return nil, fmt.Errorf("unable to get latest state: %w", err)
+	}
+	secretMap, newState, err := gen.Generate(ctx, genResource, r.Client, namespace)
 	if err != nil {
 		return nil, fmt.Errorf("unable to generate: %w", err)
+	}
+	if prevState != nil {
+		generatorState.EnqueueSetLatest(ctx, defaultGeneratorStateKey, namespace, genResource, gen, newState)
 	}
 	return &v1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -457,7 +532,7 @@ func (r *Reconciler) getSecretStoreFromName(ctx context.Context, refStore esapi.
 	return &store, nil
 }
 
-func newPushSecretCondition(condType esapi.PushSecretConditionType, status v1.ConditionStatus, reason, message string) *esapi.PushSecretStatusCondition {
+func NewPushSecretCondition(condType esapi.PushSecretConditionType, status v1.ConditionStatus, reason, message string) *esapi.PushSecretStatusCondition {
 	return &esapi.PushSecretStatusCondition{
 		Type:               condType,
 		Status:             status,
@@ -467,10 +542,11 @@ func newPushSecretCondition(condType esapi.PushSecretConditionType, status v1.Co
 	}
 }
 
-func setPushSecretCondition(ps *esapi.PushSecret, condition esapi.PushSecretStatusCondition) {
-	currentCond := getPushSecretCondition(ps.Status, condition.Type)
+func SetPushSecretCondition(ps *esapi.PushSecret, condition esapi.PushSecretStatusCondition) {
+	currentCond := GetPushSecretCondition(ps.Status.Conditions, condition.Type)
 	if currentCond != nil && currentCond.Status == condition.Status &&
 		currentCond.Reason == condition.Reason && currentCond.Message == condition.Message {
+		psmetrics.UpdatePushSecretCondition(ps, &condition, 1.0)
 		return
 	}
 
@@ -479,11 +555,17 @@ func setPushSecretCondition(ps *esapi.PushSecret, condition esapi.PushSecretStat
 		condition.LastTransitionTime = currentCond.LastTransitionTime
 	}
 
-	ps.Status.Conditions = append(filterOutCondition(ps.Status.Conditions, condition.Type), condition)
+	ps.Status.Conditions = append(FilterOutCondition(ps.Status.Conditions, condition.Type), condition)
+
+	if currentCond != nil {
+		psmetrics.UpdatePushSecretCondition(ps, currentCond, 0.0)
+	}
+
+	psmetrics.UpdatePushSecretCondition(ps, &condition, 1.0)
 }
 
-// filterOutCondition returns an empty set of conditions with the provided type.
-func filterOutCondition(conditions []esapi.PushSecretStatusCondition, condType esapi.PushSecretConditionType) []esapi.PushSecretStatusCondition {
+// FilterOutCondition returns an empty set of conditions with the provided type.
+func FilterOutCondition(conditions []esapi.PushSecretStatusCondition, condType esapi.PushSecretConditionType) []esapi.PushSecretStatusCondition {
 	newConditions := make([]esapi.PushSecretStatusCondition, 0, len(conditions))
 	for _, c := range conditions {
 		if c.Type == condType {
@@ -494,10 +576,10 @@ func filterOutCondition(conditions []esapi.PushSecretStatusCondition, condType e
 	return newConditions
 }
 
-// getPushSecretCondition returns the condition with the provided type.
-func getPushSecretCondition(status esapi.PushSecretStatus, condType esapi.PushSecretConditionType) *esapi.PushSecretStatusCondition {
-	for i := range status.Conditions {
-		c := status.Conditions[i]
+// GetPushSecretCondition returns the condition with the provided type.
+func GetPushSecretCondition(conditions []esapi.PushSecretStatusCondition, condType esapi.PushSecretConditionType) *esapi.PushSecretStatusCondition {
+	for i := range conditions {
+		c := conditions[i]
 		if c.Type == condType {
 			return &c
 		}
