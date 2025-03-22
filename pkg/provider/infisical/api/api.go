@@ -48,6 +48,8 @@ const (
 	machineIdentityLoginViaUniversalAuth = "MachineIdentityLoginViaUniversalAuth"
 	getSecretsV3                         = "GetSecretsV3"
 	getSecretByKeyV3                     = "GetSecretByKeyV3"
+	createSecretV3                       = "CreateSecretV3"
+	updateSecretV3                       = "UpdateSecretV3"
 	revokeAccessToken                    = "RevokeAccessToken"
 )
 
@@ -299,71 +301,51 @@ func (a *InfisicalClient) GetSecretByKeyV3(data GetSecretByKeyV3Request) (string
 }
 
 func (a *InfisicalClient) CreateSecretV3(data ChangeSecretV3Request) error {
-	endpointURL := a.resolveEndpoint(fmt.Sprintf("api/v3/secrets/raw/%s", data.SecretKey))
-	body, err := MarshalReqBody(data)
+	endpointURL := fmt.Sprintf("api/v3/secrets/raw/%s", data.SecretKey)
+
+	res := GetSecretByKeyV3Response{}
+	err := a.do(
+		endpointURL,
+		http.MethodPost,
+		map[string]string{},
+		data,
+		&res,
+	)
+	metrics.ObserveAPICall(constants.ProviderName, createSecretV3, err)
+
 	if err != nil {
-		return err
-	}
-
-	req, err := http.NewRequest(http.MethodPost, endpointURL, body)
-	metrics.ObserveAPICall(constants.ProviderName, "CreateSecretV3", err)
-	if err != nil {
-		return err
-	}
-
-	rawRes, err := a.do(req)
-	if err != nil {
-		return err
-	}
-
-	if rawRes.StatusCode == 200 {
-		return nil
-	} else {
-		var errRes InfisicalAPIErrorResponse
-		err = ReadAndUnmarshal(rawRes, &errRes)
-		if err != nil {
-			return fmt.Errorf(errJSONSecretUnmarshal, err)
-		}
-
-		if errRes.Message == "Secret not found" || errRes.Message == "Folder not found for the given environment slug & secret path" {
+		var apiErr *InfisicalAPIError
+		if errors.As(err, &apiErr) && apiErr.StatusCode == 404 {
 			return esv1beta1.NoSecretError{}
 		}
-		return errors.New(errRes.Message)
+		return err
 	}
+
+	return nil
 }
 
 func (a *InfisicalClient) UpdateSecretV3(data ChangeSecretV3Request) error {
-	endpointURL := a.resolveEndpoint(fmt.Sprintf("api/v3/secrets/raw/%s", data.SecretKey))
-	body, err := MarshalReqBody(data)
+	endpointURL := fmt.Sprintf("api/v3/secrets/raw/%s", data.SecretKey)
+
+	res := GetSecretByKeyV3Response{}
+	err := a.do(
+		endpointURL,
+		http.MethodPatch,
+		map[string]string{},
+		data,
+		&res,
+	)
+	metrics.ObserveAPICall(constants.ProviderName, updateSecretV3, err)
+
 	if err != nil {
-		return err
-	}
-
-	req, err := http.NewRequest(http.MethodPatch, endpointURL, body)
-	metrics.ObserveAPICall(constants.ProviderName, "UpdateSecretV3", err)
-	if err != nil {
-		return err
-	}
-
-	rawRes, err := a.do(req)
-	if err != nil {
-		return err
-	}
-
-	if rawRes.StatusCode == 200 {
-		return nil
-	} else {
-		var errRes InfisicalAPIErrorResponse
-		err = ReadAndUnmarshal(rawRes, &errRes)
-		if err != nil {
-			return fmt.Errorf(errJSONSecretUnmarshal, err)
-		}
-
-		if errRes.Message == "Secret not found" || errRes.Message == "Folder not found for the given environment slug & secret path" {
+		var apiErr *InfisicalAPIError
+		if errors.As(err, &apiErr) && apiErr.StatusCode == 404 {
 			return esv1beta1.NoSecretError{}
 		}
-		return errors.New(errRes.Message)
+		return err
 	}
+
+	return nil
 }
 
 func MarshalReqBody(data any) (*bytes.Reader, error) {

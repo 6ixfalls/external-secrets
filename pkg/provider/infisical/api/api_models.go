@@ -67,7 +67,7 @@ type GetSecretsV3Response struct {
 
 type ChangeSecretV3Request struct {
 	EnvironmentSlug string `json:"environment"`
-	ProjectSlug     string `json:"workspaceId"`
+	ProjectSlug     string `json:"workspaceSlug"`
 	SecretPath      string `json:"secretPath,omitempty"`
 	SecretKey       string `json:"secretKey"`
 	SecretValue     string `json:"secretValue"`
